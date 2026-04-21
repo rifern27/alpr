@@ -711,12 +711,53 @@ def process_image_ocr(file_bytes: bytes, filename: str, crop_area: tuple | None 
 # =============================================================================
 # API
 # =============================================================================
-import json
+import json, secrets, time, hmac, hashlib, base64
 from typing import Optional
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Depends
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
+# --- Auth config (set via env var, fallback ke default) ---
+_SECRET_KEY      = os.getenv("SECRET_KEY", secrets.token_hex(32))
+_API_USERNAME    = os.getenv("API_USERNAME", "CODA")
+_API_PASSWORD    = os.getenv("API_PASSWORD") or secrets.token_urlsafe(12)
+_TOKEN_EXPIRE_H  = int(os.getenv("TOKEN_EXPIRE_HOURS", "24"))
+
+_bearer = HTTPBearer(auto_error=False)
+
+def _make_token(username: str) -> str:
+    exp     = int(time.time()) + _TOKEN_EXPIRE_H * 3600
+    payload = base64.urlsafe_b64encode(
+        json.dumps({"sub": username, "exp": exp}).encode()
+    ).decode().rstrip("=")
+    sig = hmac.new(_SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return f"{payload}.{sig}"
+
+def _verify_token(token: str) -> str | None:
+    try:
+        payload_b64, sig = token.rsplit(".", 1)
+        expected = hmac.new(_SECRET_KEY.encode(), payload_b64.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return None
+        padding  = "=" * (-len(payload_b64) % 4)
+        data     = json.loads(base64.urlsafe_b64decode(payload_b64 + padding))
+        if data["exp"] < time.time():
+            return None
+        return data["sub"]
+    except Exception:
+        return None
+
+def _require_auth(creds: HTTPAuthorizationCredentials = Depends(_bearer)) -> str:
+    token = creds.credentials if creds else None
+    if not token:
+        raise HTTPException(401, "Token tidak ditemukan", headers={"WWW-Authenticate": "Bearer"})
+    user = _verify_token(token)
+    if not user:
+        raise HTTPException(401, "Token tidak valid atau sudah expired", headers={"WWW-Authenticate": "Bearer"})
+    return user
+
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -724,6 +765,11 @@ async def lifespan(_app: FastAPI):
         rapid_reader(np.zeros((100, 100, 3), dtype=np.uint8))
     except Exception:
         pass
+    print("=" * 48)
+    print(f"  Username : {_API_USERNAME}")
+    print(f"  Password : {_API_PASSWORD}")
+    print(f"  Token expires in {_TOKEN_EXPIRE_H}h")
+    print("=" * 48)
     yield
 
 app = FastAPI(
@@ -737,10 +783,23 @@ app = FastAPI(
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
+@app.post("/token")
+async def login(username: str = Form(...), password: str = Form(...)):
+    if username != _API_USERNAME or password != _API_PASSWORD:
+        raise HTTPException(401, "Username atau password salah")
+    token = _make_token(username)
+    return {
+        "access_token": token,
+        "token_type":   "bearer",
+        "expires_in":   _TOKEN_EXPIRE_H * 3600,
+    }
+
+
 @app.post("/recognize")
 async def recognize(
     image: UploadFile = File(...),
     crop_area: Optional[str] = Form(None),
+    _user: str = Depends(_require_auth),
 ):
     if not image:
         raise HTTPException(400, "File kosong")
@@ -766,7 +825,6 @@ async def recognize(
 
     plate_text = (result.get("full_text") or "").strip().upper()
 
-    # Retry tanpa crop jika hasil kosong
     if not plate_text and crop_tuple is not None:
         try:
             result     = await run_in_threadpool(process_image_ocr, contents, safe_filename, None)
@@ -774,7 +832,6 @@ async def recognize(
         except Exception:
             pass
 
-    # Fallback ke teks pertama dari details jika full_text masih kosong
     if not plate_text and result.get("details"):
         try:
             plate_text = result["details"][0].get("text", "").strip().upper()
@@ -792,18 +849,15 @@ def _debug_ocr(file_bytes: bytes) -> dict:
 
     h, w = img.shape[:2]
 
-    # Test rapid_reader langsung pada gambar asli
     try:
         raw, _ = rapid_reader(img)
         raw_texts = [(item[1], round(float(item[2]), 3)) for item in raw] if raw else []
     except Exception as e:
         raw_texts = [f"ERROR: {e}"]
 
-    # Test deteksi region plat
     detected, det_coords = _detect_plate_region(img)
     plate_region = str(det_coords) if det_coords else "tidak terdeteksi"
 
-    # Test rapid_reader pada crop plat (jika terdeteksi)
     plate_texts = []
     if detected is not None:
         try:
@@ -813,16 +867,19 @@ def _debug_ocr(file_bytes: bytes) -> dict:
             plate_texts = [f"ERROR: {e}"]
 
     return {
-        "img_size":       f"{w}x{h}",
-        "raw_ocr_count":  len(raw_texts),
-        "raw_ocr_texts":  raw_texts,
-        "plate_region":   plate_region,
+        "img_size":        f"{w}x{h}",
+        "raw_ocr_count":   len(raw_texts),
+        "raw_ocr_texts":   raw_texts,
+        "plate_region":    plate_region,
         "plate_ocr_count": len(plate_texts),
         "plate_ocr_texts": plate_texts,
     }
 
 @app.post("/recognize-debug")
-async def recognize_debug(image: UploadFile = File(...)):
+async def recognize_debug(
+    image: UploadFile = File(...),
+    _user: str = Depends(_require_auth),
+):
     if not image:
         raise HTTPException(400, "File kosong")
     contents = await image.read()
